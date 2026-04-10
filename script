@@ -1,0 +1,229 @@
+(async function () {
+    let allItems = [];
+    let page = 1;
+
+    const activeElement = document.querySelector(".element-header-bar .element-header-bar-element.active a");
+    const baseUrl = activeElement ? activeElement.href : "https://zonatmo.com/profile/read";
+    const selectedTitle = activeElement
+        ?.querySelector("small.element-header-bar-element-title")
+        ?.textContent.trim() || "SinNombre";
+
+    console.log(`Base URL: ${baseUrl} | Lista: ${selectedTitle}`);
+
+    function getImageFromCSS(doc, className) {
+        for (const sheet of doc.styleSheets) {
+            let rules;
+            try { rules = sheet.cssRules; } catch (e) { continue; }
+            for (const rule of rules) {
+                if (rule.selectorText?.includes(className) && rule.selectorText?.includes("::before")) {
+                    const match = rule.style.getPropertyValue("background-image").match(/url\(['"]?([^'"]+)['"]?\)/);
+                    if (match) return match[1];
+                }
+            }
+        }
+        return null;
+    }
+
+    function imgToBase64ViaCanvas(url) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+                try {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    canvas.getContext("2d").drawImage(img, 0, 0);
+                    resolve(canvas.toDataURL("image/webp"));
+                } catch { resolve(null); }
+            };
+            img.onerror = () => resolve(null);
+            img.src = url;
+        });
+    }
+
+    function toBase64WithProxy(url) {
+        return new Promise((resolve) => {
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+                try {
+                    const canvas = document.createElement("canvas");
+                    canvas.width = img.naturalWidth;
+                    canvas.height = img.naturalHeight;
+                    canvas.getContext("2d").drawImage(img, 0, 0);
+                    resolve(canvas.toDataURL("image/webp"));
+                } catch { resolve(null); }
+            };
+            img.onerror = () => resolve(null);
+            img.src = `https://wsrv.nl/?url=${encodeURIComponent(url)}&output=webp`;
+        });
+    }
+
+    // Extrae toda la info detallada desde la página individual del manga
+    async function fetchMangaDetails(link) {
+        try {
+            const res = await fetch(link);
+            if (!res.ok) return null;
+            const html = await res.text();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+
+            const description = doc.querySelector(".element-description")?.innerText?.trim() || "";
+            const tipo = doc.querySelector("h1.book-type")?.innerText?.trim() || "";
+            const año = doc.querySelector(".element-title small")?.innerText?.replace(/[()]/g, "").trim() || "";
+            const score = doc.querySelector(".score span")?.innerText?.trim() || "";
+            const demografia = doc.querySelector(".demography")?.innerText?.trim() || "";
+            const estado = doc.querySelector(".book-status")?.innerText?.trim() || "";
+
+            const generos = [...doc.querySelectorAll("h6 a.badge-primary")]
+                .map(a => a.innerText.trim()).join(", ");
+
+            const sinonimos = [...doc.querySelectorAll(".badge-pill.badge-transparent")]
+                .map(s => s.innerText.trim()).join(" | ");
+
+            // Capítulos: número y si fue visto (solo disponible si estás logueado)
+            const capitulos = [...doc.querySelectorAll(".upload-link")]
+                .map(li => {
+                    const numText = li.querySelector(".btn-collapse")?.innerText?.trim() || "";
+                    const numero = numText.match(/Capítulo\s+([\d.]+)/i)?.[1] || numText;
+                    const visto = li.querySelector(".chapter-viewed-icon.viewed") !== null;
+                    return { numero, visto };
+                });
+
+            const totalCapitulos = capitulos.length;
+            const vistos = capitulos.filter(c => c.visto).length;
+            const listaCapitulos = capitulos.map(c =>
+                `Cap. ${c.numero}${c.visto ? " ✓" : ""}`
+            ).join(", ");
+
+            return { description, tipo, año, score, demografia, estado, generos, sinonimos, totalCapitulos, vistos, listaCapitulos };
+        } catch (e) {
+            console.warn("Error al obtener detalles:", e);
+            return null;
+        }
+    }
+
+    // --- Paso 1: recolectar lista paginada ---
+    while (true) {
+        console.log(`Cargando página ${page}...`);
+        const response = await fetch(`${baseUrl}?page=${page}`);
+        if (!response.ok) { console.error(`Error en página ${page}`); break; }
+
+        const html = await response.text();
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+
+        const items = [...doc.querySelectorAll(".element.proyect-item")];
+        if (items.length === 0) { console.log("No hay más ítems."); break; }
+
+        items.forEach(item => {
+            const title = item.querySelector(".thumbnail-title h4.text-truncate")?.getAttribute("title")?.trim() || "Sin título";
+            const link = item.querySelector("a")?.getAttribute("href")?.trim() || "";
+            const thumbnailEl = item.querySelector("[class*='book-thumbnail-']");
+            const thumbnailClass = [...(thumbnailEl?.classList || [])].find(c => c.startsWith("book-thumbnail-"));
+            const imageUrl = thumbnailClass ? getImageFromCSS(doc, thumbnailClass) : null;
+            allItems.push({ title, link, imageUrl, imageBase64: null, details: null });
+        });
+
+        console.log(`Página ${page} procesada. (${allItems.length} mangas hasta ahora)`);
+        page++;
+    }
+
+    // --- Paso 2: descargar imagen y detalles de cada manga ---
+    for (let i = 0; i < allItems.length; i++) {
+        const item = allItems[i];
+        console.log(`[${i + 1}/${allItems.length}] Procesando: ${item.title}`);
+
+        // Imagen
+        if (item.imageUrl) {
+            item.imageBase64 = await imgToBase64ViaCanvas(item.imageUrl);
+            if (!item.imageBase64) item.imageBase64 = await toBase64WithProxy(item.imageUrl);
+        }
+
+        // Detalles
+        if (item.link) {
+            item.details = await fetchMangaDetails(item.link);
+        }
+    }
+
+    // --- Paso 3: generar HTML ---
+    console.log("Generando HTML...");
+
+    const cards = allItems.map(item => {
+        const d = item.details;
+        const imgSrc = item.imageBase64 || item.imageUrl || "";
+
+        return `
+        <div class="card">
+            <div class="card-header">
+                <img src="${imgSrc}" alt="${item.title}">
+                <div class="card-meta">
+                    <h2>${item.title}</h2>
+                    ${d?.tipo ? `<span class="badge tipo">${d.tipo}</span>` : ""}
+                    ${d?.demografia ? `<span class="badge demo">${d.demografia}</span>` : ""}
+                    ${d?.estado ? `<span class="badge estado">${d.estado}</span>` : ""}
+                    ${d?.año ? `<span class="badge año">📅 ${d.año}</span>` : ""}
+                    ${d?.score ? `<span class="badge score">⭐ ${d.score}</span>` : ""}
+                    ${d?.vistos !== undefined ? `<span class="badge caps">📖 ${d.vistos}/${d.totalCapitulos} caps vistos</span>` : ""}
+                </div>
+            </div>
+            ${d?.description ? `<p class="description">${d.description}</p>` : ""}
+            ${d?.generos ? `<p><strong>Géneros:</strong> ${d.generos}</p>` : ""}
+            ${d?.sinonimos ? `<p><strong>Sinónimos:</strong> ${d.sinonimos}</p>` : ""}
+            ${d?.listaCapitulos ? `
+                <details>
+                    <summary>📋 Ver capítulos (${d.totalCapitulos})</summary>
+                    <p class="caps-list">${d.listaCapitulos}</p>
+                </details>` : ""}
+            ${item.link ? `<a class="link" href="${item.link}" target="_blank">Ver en ZonaTMO →</a>` : ""}
+        </div>`;
+    }).join("");
+
+    const htmlContent = `<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>Lista: ${selectedTitle}</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        h1 { color: #e94560; margin-bottom: 6px; }
+        .subtitle { color: #aaa; margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+        .card { background: #16213e; border-radius: 10px; overflow: hidden; display: flex; flex-direction: column; }
+        .card-header { display: flex; gap: 12px; padding: 12px; background: #0f3460; }
+        .card-header img { width: 80px; height: 110px; object-fit: cover; border-radius: 6px; flex-shrink: 0; }
+        .card-meta { display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+        .card-meta h2 { font-size: 15px; line-height: 1.3; color: #fff; }
+        .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: #1a1a2e; color: #ccc; margin: 2px 2px 0 0; }
+        .badge.score { color: #ffd700; }
+        .badge.caps { color: #7ec8e3; }
+        .badge.estado { color: #90ee90; }
+        .description { font-size: 13px; color: #bbb; padding: 12px; line-height: 1.5; border-bottom: 1px solid #0f3460; }
+        .card p { font-size: 12px; color: #aaa; padding: 6px 12px; }
+        .card p strong { color: #eee; }
+        details { padding: 8px 12px; }
+        summary { cursor: pointer; font-size: 13px; color: #7ec8e3; }
+        .caps-list { font-size: 11px; color: #aaa; margin-top: 6px; line-height: 1.8; }
+        .link { display: block; text-align: center; padding: 8px; background: #0f3460; color: #7ec8e3; text-decoration: none; font-size: 13px; margin-top: auto; }
+        .link:hover { background: #e94560; color: #fff; }
+    </style>
+</head>
+<body>
+    <h1>📚 Lista: ${selectedTitle}</h1>
+    <p class="subtitle">${allItems.length} mangas guardados</p>
+    <div class="grid">${cards}</div>
+</body>
+</html>`;
+
+    const blob = new Blob([htmlContent], { type: "text/html;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `Lista de ${selectedTitle}.html`;
+    a.click();
+    URL.revokeObjectURL(url);
+
+    console.log("✅ Exportado con éxito.");
+})();
